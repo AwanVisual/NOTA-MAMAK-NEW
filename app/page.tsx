@@ -236,7 +236,7 @@ export default function PosApp() {
       let receiptText = "";
       
       receiptText += "\x1B\x40"; // Perintah inisialisasi printer
-      receiptText += "\x1B\x33\x14"; // Rapatkan jarak antar-baris (line spacing)
+  
       
       // HEADER (Tengah)
       receiptText += "\x1B\x61\x01"; // Align Center

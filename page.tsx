@@ -190,7 +190,7 @@ export default function PosApp() {
 
   // =========================================================== //
 
-// LOGIKA CETAK PRINTER (Bluetooth ESC/POS)
+// LOGIKA CETAK PRINTER (Bluetooth ESC/POS - Hemat Kertas 1 Baris)
   const handlePrint = async () => {
     if (!savedReceiptId) return alert('Harap simpan transaksi terlebih dahulu sebelum mencetak!');
     
@@ -225,57 +225,69 @@ export default function PosApp() {
       }
 
       // 4. SUSUN TEKS STRUK (Kertas 80mm = 48 karakter per baris)
+      const LINE_WIDTH = 48;
       let receiptText = "";
       
       receiptText += "\x1B\x40"; // Perintah inisialisasi printer
+      receiptText += "\x1B\x33\x14"; // Rapatkan jarak antar-baris (line spacing) agar hemat kertas
       
       // HEADER (Tengah)
       receiptText += "\x1B\x61\x01"; // Align Center
-      receiptText += `${shop.name.toUpperCase()}\n`;
-      receiptText += `${shop.address}\n`;
-      receiptText += "------------------------------------------------\n"; // 48 Karakter
+      receiptText += `${(shop.name || 'NAMA TOKO').toUpperCase()}\n`;
+      if (shop.address) receiptText += `${shop.address}\n`;
+      receiptText += "-".repeat(LINE_WIDTH) + "\n";
       
-      // INFO TRANSAKSI (Kiri)
+      // INFO TRANSAKSI (Digabung 2 kolom per baris agar hemat kertas)
       receiptText += "\x1B\x61\x00"; // Align Left
-      receiptText += `No   : ${trxInfo.number}\n`;
-      receiptText += `Tgl  : ${trxInfo.date} ${trxInfo.time}\n`;
-      receiptText += `Kasir: ${trxInfo.cashier}\n`;
-      if (member.name) receiptText += `Member: ${member.name}\n`;
-      receiptText += "------------------------------------------------\n";
+      const noStr = `No: ${trxInfo.number}`;
+      const tglStr = `${trxInfo.date} ${trxInfo.time}`;
+      receiptText += noStr + " ".repeat(Math.max(1, LINE_WIDTH - noStr.length - tglStr.length)) + tglStr + "\n";
+
+      const kasirStr = `Kasir: ${trxInfo.cashier}`;
+      const memberStr = `Mbr: ${member.name || '-'}`;
+      receiptText += kasirStr + " ".repeat(Math.max(1, LINE_WIDTH - kasirStr.length - memberStr.length)) + memberStr + "\n";
+      receiptText += "-".repeat(LINE_WIDTH) + "\n";
       
-      // DAFTAR BARANG
+      // DAFTAR BARANG (Format 1 Baris: Nama Barang + QtyxHarga + Total)
       items.forEach(item => {
-        let itemName = item.name.length > 48 ? item.name.substring(0, 48) : item.name;
-        let itemTotal = `Rp ${((item.price * item.qty) - item.discount).toLocaleString('id-ID')}`;
+        const qtyPrice = `${item.qty}x${item.price.toLocaleString('id-ID')}`;
+        const itemTotal = ((item.price * item.qty) - item.discount).toLocaleString('id-ID');
         
-        let qtyStr = `${item.qty}x ${item.price.toLocaleString('id-ID')}`;
-        if (item.discount > 0) qtyStr += ` (Disc -${item.discount.toLocaleString('id-ID')})`;
+        // Bagian kanan: " 2x15.000   30.000"
+        const rightSide = ` ${qtyPrice} ${itemTotal.padStart(9, ' ')}`;
         
-        receiptText += `${itemName}\n`;
-        
-        // Logika agar Total Harga selalu rata kanan
-        let spacesCount = 48 - (qtyStr.length + itemTotal.length);
-        let spaces = " ".repeat(Math.max(1, spacesCount));
-        
-        receiptText += `${qtyStr}${spaces}${itemTotal}\n`;
+        // Sisa ruang karakter di kiri untuk Nama Barang
+        const maxNameLen = Math.max(10, LINE_WIDTH - rightSide.length);
+        const cleanName = item.name.length > maxNameLen 
+          ? item.name.substring(0, maxNameLen) 
+          : item.name.padEnd(maxNameLen, ' ');
+
+        receiptText += `${cleanName}${rightSide}\n`;
+
+        // Baris tambahan hanya muncul jika barang tersebut ada diskon
+        if (item.discount > 0) {
+          const discStr = `(Disc: -${item.discount.toLocaleString('id-ID')})`;
+          receiptText += discStr.padStart(LINE_WIDTH, ' ') + "\n";
+        }
       });
       
-      receiptText += "------------------------------------------------\n";
+      receiptText += "-".repeat(LINE_WIDTH) + "\n";
       
-      // TOTAL (Kanan)
-      receiptText += "\x1B\x61\x02"; // Align Right
-      receiptText += `GRAND TOTAL: Rp ${grandTotal.toLocaleString('id-ID')}\n\n`;
+      // TOTAL (Satu baris rata kiri-kanan)
+      const labelTotal = "GRAND TOTAL";
+      const valTotal = `Rp ${grandTotal.toLocaleString('id-ID')}`;
+      receiptText += "\x1B\x45\x01"; // Bold ON
+      receiptText += labelTotal + " ".repeat(Math.max(1, LINE_WIDTH - labelTotal.length - valTotal.length)) + valTotal + "\n";
+      receiptText += "\x1B\x45\x00"; // Bold OFF
       
       // FOOTER (Tengah)
       receiptText += "\x1B\x61\x01"; // Align Center
-      receiptText += "Terima Kasih\n";
-      receiptText += "Barang yang sudah dibeli tidak dapat ditukar\n";
-      receiptText += "\n\n\n\n"; // Feed kertas agar keluar dari mesin pemotong
+      receiptText += "Terima Kasih - Barang yg dibeli tdk dpt ditukar\n";
+      receiptText += "\n\n\n"; // Feed kertas secukupnya sebelum dipotong
       
       receiptText += "\x1D\x56\x00"; // Perintah Potong Kertas Otomatis (Full Cut)
 
       // 5. ENCODE & KIRIM DATA KE PRINTER (Dalam chunk kecil/potongan)
-      // Bluetooth LE punya batas transfer per paket, jadi kita potong per 100 byte
       const encoder = new TextEncoder();
       const data = encoder.encode(receiptText);
       const CHUNK_SIZE = 100; 
@@ -286,8 +298,6 @@ export default function PosApp() {
       }
 
       console.log('Struk berhasil dicetak!');
-      
-      // Memutuskan koneksi secara opsional setelah selesai
       device.gatt?.disconnect();
 
     } catch (err: any) {
@@ -295,7 +305,6 @@ export default function PosApp() {
       alert('Gagal mencetak: ' + err.message);
     }
   };
-
   return (
     <div className="min-h-screen bg-gray-50 p-6 flex flex-col xl:flex-row gap-6 font-sans text-sm relative">
       

@@ -3,6 +3,13 @@ import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { Printer, Save, Plus, Trash2, Edit, RefreshCw, History, X } from 'lucide-react';
 
+// Deklarasi tipe agar TypeScript mengenali navigator.bluetooth tanpa error
+declare global {
+  interface Navigator {
+    bluetooth?: any;
+  }
+}
+
 export default function PosApp() {
   // 1. State Pengaturan Toko
   const [shop, setShop] = useState({ name: '', address: '' });
@@ -190,19 +197,115 @@ export default function PosApp() {
 
   // =========================================================== //
 
-  // LOGIKA CETAK PRINTER
+  // LOGIKA CETAK PRINTER (Bluetooth ESC/POS - Hemat Kertas 1 Baris)
   const handlePrint = async () => {
     if (!savedReceiptId) return alert('Harap simpan transaksi terlebih dahulu sebelum mencetak!');
     
+    if (typeof navigator === 'undefined' || !navigator.bluetooth) {
+      return alert('Web Bluetooth API tidak tersedia. Pastikan Anda menggunakan Chrome/Edge dan mengakses web melalui localhost atau HTTPS.');
+    }
+
     try {
+      // 1. Request Device (Meminta izin koneksi ke printer)
       const device = await navigator.bluetooth.requestDevice({
         acceptAllDevices: true,
-        optionalServices: ['000018f0-0000-1000-8000-00805f9b34fb'] 
+        optionalServices: [
+          '000018f0-0000-1000-8000-00805f9b34fb', // UUID Standar Thermal Printer
+          'e7810a71-73ae-499d-8c15-faa9aef0c3f2'  // UUID Alternatif Serial
+        ] 
       });
-      console.log('Mencetak struk untuk transaksi:', trxInfo.number);
-      alert('Perintah cetak dikirim ke printer!');
-    } catch (err) {
-      console.error('Gagal konek printer:', err);
+
+      console.log('Menghubungkan ke printer...');
+      
+      // 2. Konek ke GATT Server
+      const server = await device.gatt.connect();
+
+      // 3. Cari Service & Characteristic (Jalur untuk mengirim data ke printer)
+      let service, characteristic;
+      try {
+        service = await server.getPrimaryService('000018f0-0000-1000-8000-00805f9b34fb');
+        characteristic = await service.getCharacteristic('00002af1-0000-1000-8000-00805f9b34fb');
+      } catch (e) {
+        // Fallback jika printer menggunakan UUID alternatif
+        service = await server.getPrimaryService('e7810a71-73ae-499d-8c15-faa9aef0c3f2');
+        characteristic = await service.getCharacteristic('bef8d6c9-9c21-4c9e-b632-bd58c1009f9f');
+      }
+
+      // 4. SUSUN TEKS STRUK (Kertas 80mm = 48 karakter per baris)
+      const LINE_WIDTH = 48;
+      let receiptText = "";
+      
+      receiptText += "\x1B\x40"; // Perintah inisialisasi printer
+      receiptText += "\x1B\x33\x14"; // Rapatkan jarak antar-baris (line spacing)
+      
+      // HEADER (Tengah)
+      receiptText += "\x1B\x61\x01"; // Align Center
+      receiptText += `${(shop.name || 'NAMA TOKO').toUpperCase()}\n`;
+      if (shop.address) receiptText += `${shop.address}\n`;
+      receiptText += "-".repeat(LINE_WIDTH) + "\n";
+      
+      // INFO TRANSAKSI (2 kolom per baris)
+      receiptText += "\x1B\x61\x00"; // Align Left
+      const noStr = `No: ${trxInfo.number}`;
+      const tglStr = `${trxInfo.date} ${trxInfo.time}`;
+      receiptText += noStr + " ".repeat(Math.max(1, LINE_WIDTH - noStr.length - tglStr.length)) + tglStr + "\n";
+
+      const kasirStr = `Kasir: ${trxInfo.cashier}`;
+      const memberStr = `Mbr: ${member.name || '-'}`;
+      receiptText += kasirStr + " ".repeat(Math.max(1, LINE_WIDTH - kasirStr.length - memberStr.length)) + memberStr + "\n";
+      receiptText += "-".repeat(LINE_WIDTH) + "\n";
+      
+      // DAFTAR BARANG (Format 1 Baris: Nama Barang + QtyxHarga + Total)
+      items.forEach(item => {
+        const qtyPrice = `${item.qty}x${item.price.toLocaleString('id-ID')}`;
+        const itemTotal = ((item.price * item.qty) - item.discount).toLocaleString('id-ID');
+        
+        const rightSide = ` ${qtyPrice} ${itemTotal.padStart(9, ' ')}`;
+        const maxNameLen = Math.max(10, LINE_WIDTH - rightSide.length);
+        const cleanName = item.name.length > maxNameLen 
+          ? item.name.substring(0, maxNameLen) 
+          : item.name.padEnd(maxNameLen, ' ');
+
+        receiptText += `${cleanName}${rightSide}\n`;
+
+        if (item.discount > 0) {
+          const discStr = `(Disc: -${item.discount.toLocaleString('id-ID')})`;
+          receiptText += discStr.padStart(LINE_WIDTH, ' ') + "\n";
+        }
+      });
+      
+      receiptText += "-".repeat(LINE_WIDTH) + "\n";
+      
+      // TOTAL (Satu baris rata kiri-kanan)
+      const labelTotal = "GRAND TOTAL";
+      const valTotal = `Rp ${grandTotal.toLocaleString('id-ID')}`;
+      receiptText += "\x1B\x45\x01"; // Bold ON
+      receiptText += labelTotal + " ".repeat(Math.max(1, LINE_WIDTH - labelTotal.length - valTotal.length)) + valTotal + "\n";
+      receiptText += "\x1B\x45\x00"; // Bold OFF
+      
+      // FOOTER (Tengah)
+      receiptText += "\x1B\x61\x01"; // Align Center
+      receiptText += "Terima Kasih - Barang yg dibeli tdk dpt ditukar\n";
+      receiptText += "\n\n\n"; // Feed kertas secukupnya sebelum dipotong
+      
+      receiptText += "\x1D\x56\x00"; // Perintah Potong Kertas Otomatis (Full Cut)
+
+      // 5. ENCODE & KIRIM DATA KE PRINTER (Dalam chunk kecil/potongan)
+      const encoder = new TextEncoder();
+      const data = encoder.encode(receiptText);
+      const CHUNK_SIZE = 100; 
+
+      for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+        const chunk = data.slice(i, i + CHUNK_SIZE);
+        await characteristic.writeValue(chunk);
+      }
+
+      console.log('Struk berhasil dicetak!');
+      device.gatt?.disconnect();
+
+    } catch (err: any) {
+      console.error('Gagal konek/cetak:', err);
+      alert('Gagal mencetak: ' + err.message);
     }
   };
 
@@ -241,7 +344,7 @@ export default function PosApp() {
                         <td className="p-3 font-medium text-blue-600">{trx.transaction_number}</td>
                         <td className="p-3">{trx.admin_name}</td>
                         <td className="p-3">{trx.member_name || '-'}</td>
-                        <td className="p-3 font-bold">Rp {trx.grand_total.toLocaleString()}</td>
+                        <td className="p-3 font-bold">Rp {trx.grand_total.toLocaleString('id-ID')}</td>
                         <td className="p-3 text-center">
                           <button onClick={() => loadTransaction(trx)} className="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600 text-xs font-semibold shadow-sm">
                             Buka & Cetak
@@ -341,9 +444,9 @@ export default function PosApp() {
                  <tr key={idx} className="border-t">
                    <td className="p-2">{item.name}</td>
                    <td className="p-2">{item.qty}</td>
-                   <td className="p-2">Rp {item.price.toLocaleString()}</td>
-                   <td className="p-2 text-red-500">-Rp {item.discount.toLocaleString()}</td>
-                   <td className="p-2 font-semibold">Rp {((item.price * item.qty) - item.discount).toLocaleString()}</td>
+                   <td className="p-2">Rp {item.price.toLocaleString('id-ID')}</td>
+                   <td className="p-2 text-red-500">-Rp {item.discount.toLocaleString('id-ID')}</td>
+                   <td className="p-2 font-semibold">Rp {((item.price * item.qty) - item.discount).toLocaleString('id-ID')}</td>
                    <td className="p-2 text-center">
                      <button onClick={() => handleRemoveItem(idx)} className="text-red-500 hover:bg-red-50 p-1 rounded"><Trash2 size={16}/></button>
                    </td>
@@ -368,39 +471,45 @@ export default function PosApp() {
           </button>
 
           {/* Visual Kertas Struk 80mm */}
-          <div className="bg-white p-6 shadow-md rounded-lg font-mono text-sm border border-gray-200">
-            <div className="text-center mb-4">
-              <h3 className="font-bold text-lg">{shop.name || 'NAMA TOKO'}</h3>
-              <p className="text-xs text-gray-500">{shop.address || 'Alamat Toko'}</p>
+          <div className="bg-white p-4 shadow-md rounded-lg font-mono text-xs border border-gray-200">
+            <div className="text-center mb-2">
+              <h3 className="font-bold text-base leading-tight">{shop.name || 'NAMA TOKO'}</h3>
+              <p className="text-[11px] text-gray-500">{shop.address || 'Alamat Toko'}</p>
             </div>
             
-            <div className="text-xs border-y border-dashed border-gray-400 py-2 my-2 flex flex-col gap-1">
+            <div className="text-[11px] border-y border-dashed border-gray-400 py-1.5 my-1.5 flex flex-col gap-0.5">
               <div className="flex justify-between"><span>No: {trxInfo.number}</span><span>{trxInfo.date} {trxInfo.time}</span></div>
               <div className="flex justify-between"><span>Kasir: {trxInfo.cashier}</span><span>Member: {member.name || '-'}</span></div>
             </div>
 
-            <div className="py-2 min-h-[150px]">
+            <div className="py-1 min-h-[80px] leading-tight">
                {items.length === 0 ? (
                  <p className="text-center text-gray-400 italic py-4">Belum ada barang...</p>
                ) : (
                  items.map((item, idx) => (
-                   <div key={idx} className="mb-2">
-                     <div className="flex justify-between">
-                       <span>{item.name}</span>
-                       <span>Rp {((item.price * item.qty) - item.discount).toLocaleString()}</span>
+                   <div key={idx} className="py-0.5">
+                     <div className="flex justify-between items-baseline gap-2">
+                       <span className="truncate flex-1 font-medium">{item.name}</span>
+                       <span className="text-gray-600 whitespace-nowrap">
+                         {item.qty}x{item.price.toLocaleString('id-ID')}
+                       </span>
+                       <span className="whitespace-nowrap font-semibold min-w-[65px] text-right">
+                         {((item.price * item.qty) - item.discount).toLocaleString('id-ID')}
+                       </span>
                      </div>
-                     <div className="flex justify-between text-gray-500 text-xs">
-                       <span>{item.qty} x {item.price.toLocaleString()}</span>
-                       {item.discount > 0 && <span>(Disc: -{item.discount.toLocaleString()})</span>}
-                     </div>
+                     {item.discount > 0 && (
+                       <div className="text-right text-[10px] text-gray-500">
+                         (Disc: -{item.discount.toLocaleString('id-ID')})
+                       </div>
+                     )}
                    </div>
                  ))
                )}
             </div>
 
-            <div className="border-t border-dashed border-gray-400 pt-2 flex justify-between font-bold text-base mt-2">
+            <div className="border-t border-dashed border-gray-400 pt-1.5 flex justify-between font-bold text-sm mt-1">
               <span>GRAND TOTAL</span>
-              <span>Rp {grandTotal.toLocaleString()}</span>
+              <span>Rp {grandTotal.toLocaleString('id-ID')}</span>
             </div>
           </div>
           
